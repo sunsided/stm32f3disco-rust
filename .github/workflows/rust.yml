@@ -1,0 +1,78 @@
+---
+name: Rust
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Read-only by default; no job needs more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # go install is version-pinned and checksum-verified through the Go module mirror.
+      - name: actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: false
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install target
+        run: rustup target add thumbv7em-none-eabihf
+      - name: Check format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --release --all-features
+
+  build:
+    name: Build firmware
+    needs:
+      - lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [ "", "--features slowpoke" ]
+    env:
+      FEATURES: ${{ matrix.features }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install target
+        run: rustup target add thumbv7em-none-eabihf
+      # .cargo/config.toml links through flip-link for stack overflow protection.
+      - name: Install flip-link
+        run: cargo install flip-link --version 0.1.12 --locked
+      - name: Build
+        run: |
+          # shellcheck disable=SC2086 # FEATURES is empty or a single flag pair.
+          cargo build --release $FEATURES
