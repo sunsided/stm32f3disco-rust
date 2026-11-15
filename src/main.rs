@@ -671,8 +671,7 @@ fn log_i2c_error(err: i2c::Error) {
 fn log_gyro_error(err: GyroError) {
     match err {
         l3gd20_ng::Error::Spi(SpiError(err)) => log_spi_error(err),
-        l3gd20_ng::Error::InvalidFifoMode(err) => defmt::error!("Gyroscope: {}", err),
-        _ => defmt::error!("Unknown gyroscope error"),
+        err => defmt::error!("Gyroscope error: {}", err),
     }
 }
 

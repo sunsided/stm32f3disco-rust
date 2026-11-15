@@ -48,7 +48,7 @@ impl GyroscopeChipSelect {
 }
 
 /// An SPI error of the `stm32f3xx-hal` bus.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, defmt::Format)]
 pub struct SpiError(pub spi::Error);
 
 impl embedded_hal::spi::Error for SpiError {
@@ -67,6 +67,8 @@ impl embedded_hal::spi::Error for SpiError {
 pub struct GyroSpi {
     spi: SpiType,
     cs: CsPin,
+    /// The core clock in Hz, for [`Operation::DelayNs`].
+    sysclk_hz: u32,
 }
 
 impl GyroSpi {
@@ -78,18 +80,21 @@ impl GyroSpi {
             }
             Operation::Write(words) => self.spi.write(words),
             Operation::Transfer(read, write) => {
-                for i in 0..read.len().max(write.len()) {
-                    let mut word = [write.get(i).copied().unwrap_or(0)];
-                    self.spi.transfer(&mut word)?;
-                    if let Some(out) = read.get_mut(i) {
-                        *out = word[0];
-                    }
-                }
-                Ok(())
+                // Exchange the common prefix in place, then clock out the rest of the
+                // longer buffer: surplus write words are sent, surplus read words get zeros.
+                let common = read.len().min(write.len());
+                read[..common].copy_from_slice(&write[..common]);
+                self.spi.transfer(&mut read[..common])?;
+                self.spi.write(&write[common..])?;
+                read[common..].fill(0);
+                self.spi.transfer(&mut read[common..]).map(|_| ())
             }
             Operation::TransferInPlace(words) => self.spi.transfer(words).map(|_| ()),
-            // shortcut: no delay source here; l3gd20-ng never requests one. Pass a DelayNs if that changes.
-            Operation::DelayNs(_) => Ok(()),
+            Operation::DelayNs(ns) => {
+                let cycles = u64::from(*ns) * u64::from(self.sysclk_hz) / 1_000_000_000;
+                cortex_m::asm::delay(u32::try_from(cycles + 1).unwrap_or(u32::MAX));
+                Ok(())
+            }
         }
     }
 }
@@ -131,6 +136,7 @@ impl Gyroscope {
         let mut device = L3GD20SPI::new(GyroSpi {
             spi,
             cs: chip_select.0,
+            sysclk_hz: clocks.sysclk().0,
         })?;
 
         // Requires `PE1` and `EXTI1` to be set up correctly.
