@@ -51,7 +51,7 @@ jobs:
       - name: Check format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --release --all-features
+        run: cargo clippy --release --all-features --locked
 
   build:
     name: Build firmware
@@ -75,4 +75,4 @@ jobs:
       - name: Build
         run: |
           # shellcheck disable=SC2086 # FEATURES is empty or a single flag pair.
-          cargo build --release $FEATURES
+          cargo build --release --locked $FEATURES
