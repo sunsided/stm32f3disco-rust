@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
-use chip_select::{ChipSelect, ChipSelectActiveLow, ChipSelectGuarded, DeselectOnDrop};
+use embedded_hal::spi::{ErrorKind, ErrorType, Operation, SpiDevice};
 use l3gd20_ng::{Characteristics, I16x3, L3GD20SPI};
 use l3gd20_registers::*;
 use stm32f3xx_hal::gpio::{gpioa, gpioe, Alternate, Gpioa, Gpioe, Output, Pin, PushPull, U};
+use stm32f3xx_hal::hal::blocking::spi::{Transfer, Write};
 use stm32f3xx_hal::pac::SPI1;
 use stm32f3xx_hal::prelude::*;
 use stm32f3xx_hal::rcc;
-use stm32f3xx_hal::spi::{Error, Spi};
+use stm32f3xx_hal::spi::{self, Spi};
 
 type SpiType = Spi<
     SPI1,
@@ -19,34 +20,18 @@ type SpiType = Spi<
     u8,
 >;
 
-/// SPI Driver for Bosch Sensortec L3GD20 Gyroscope
+type CsPin = Pin<Gpioe, U<3>, Output<PushPull>>;
+
+/// A gyroscope error.
+pub type GyroError = l3gd20_ng::Error<SpiError>;
+
+/// SPI Driver for the STMicroelectronics L3GD20 Gyroscope.
 pub struct Gyroscope {
-    l3gd20: L3GD20SPI<GyroscopeChipSelect, SpiType>,
+    l3gd20: L3GD20SPI<GyroSpi>,
 }
 
 /// Chip select for the L3GD20.
-pub struct GyroscopeChipSelect(
-    bool,
-    ChipSelectActiveLow<Pin<Gpioe, U<3>, Output<PushPull>>>,
-);
-
-impl ChipSelect for GyroscopeChipSelect {
-    fn select(&mut self) {
-        self.1.select()
-    }
-
-    fn deselect(&mut self) {
-        self.1.deselect()
-    }
-}
-
-impl ChipSelectGuarded for GyroscopeChipSelect {
-    type Guard<'a> = DeselectOnDrop<'a, ChipSelectActiveLow<Pin<Gpioe, U<3>, Output<PushPull>>>>;
-
-    fn select_guard(&mut self) -> Self::Guard<'_> {
-        self.1.select_guard()
-    }
-}
+pub struct GyroscopeChipSelect(CsPin);
 
 impl GyroscopeChipSelect {
     /// Initialize the chip select.
@@ -58,14 +43,77 @@ impl GyroscopeChipSelect {
         let mut l3gd20_cs = cs.into_push_pull_output(moder, otyper);
         // Disable the line.
         l3gd20_cs.set_high().ok();
-        GyroscopeChipSelect(false, l3gd20_cs.into())
+        GyroscopeChipSelect(l3gd20_cs)
+    }
+}
+
+/// An SPI error of the `stm32f3xx-hal` bus.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, defmt::Format)]
+pub struct SpiError(pub spi::Error);
+
+impl embedded_hal::spi::Error for SpiError {
+    fn kind(&self) -> ErrorKind {
+        match self.0 {
+            spi::Error::Overrun => ErrorKind::Overrun,
+            spi::Error::ModeFault => ErrorKind::ModeFault,
+            _ => ErrorKind::Other,
+        }
+    }
+}
+
+/// The SPI bus plus the gyroscope's chip select, as an embedded-hal 1.0 [`SpiDevice`].
+///
+/// `stm32f3xx-hal` 0.10 only implements the embedded-hal 0.2 traits.
+pub struct GyroSpi {
+    spi: SpiType,
+    cs: CsPin,
+    /// The core clock in Hz, for [`Operation::DelayNs`].
+    sysclk_hz: u32,
+}
+
+impl GyroSpi {
+    fn run(&mut self, operation: &mut Operation<'_, u8>) -> Result<(), spi::Error> {
+        match operation {
+            Operation::Read(words) => {
+                words.fill(0);
+                self.spi.transfer(words).map(|_| ())
+            }
+            Operation::Write(words) => self.spi.write(words),
+            Operation::Transfer(read, write) => {
+                // Exchange the common prefix in place, then clock out the rest of the
+                // longer buffer: surplus write words are sent, surplus read words get zeros.
+                let common = read.len().min(write.len());
+                read[..common].copy_from_slice(&write[..common]);
+                self.spi.transfer(&mut read[..common])?;
+                self.spi.write(&write[common..])?;
+                read[common..].fill(0);
+                self.spi.transfer(&mut read[common..]).map(|_| ())
+            }
+            Operation::TransferInPlace(words) => self.spi.transfer(words).map(|_| ()),
+            Operation::DelayNs(ns) => {
+                let cycles = u64::from(*ns) * u64::from(self.sysclk_hz) / 1_000_000_000;
+                cortex_m::asm::delay(u32::try_from(cycles + 1).unwrap_or(u32::MAX));
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ErrorType for GyroSpi {
+    type Error = SpiError;
+}
+
+impl SpiDevice for GyroSpi {
+    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), SpiError> {
+        self.cs.set_low().ok();
+        let result = operations.iter_mut().try_for_each(|op| self.run(op));
+        self.cs.set_high().ok();
+        result.map_err(SpiError)
     }
 }
 
 impl Gyroscope {
     /// Initialize the SPI connection.
-    ///
-    /// This method does not drive the chipselect. Make sure to enable it by calling [`L3GD20SPI::select_chip`].
     #[allow(clippy::too_many_arguments)]
     pub fn new<SckMode, MisoMode, MosiMode>(
         sck: gpioa::PA5<SckMode>,
@@ -78,14 +126,18 @@ impl Gyroscope {
         clocks: rcc::Clocks,
         advanced_periph_bus: &mut rcc::APB2,
         chip_select: GyroscopeChipSelect,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, GyroError> {
         let sck = sck.into_af_push_pull(moder, otyper, alternate_function_low);
         let miso = miso.into_af_push_pull(moder, otyper, alternate_function_low);
         let mosi = mosi.into_af_push_pull(moder, otyper, alternate_function_low);
 
         // Set up SPI.
         let spi = Spi::new(spi, (sck, miso, mosi), 3.MHz(), clocks, advanced_periph_bus);
-        let mut device = L3GD20SPI::new(spi, chip_select)?;
+        let mut device = L3GD20SPI::new(GyroSpi {
+            spi,
+            cs: chip_select.0,
+            sysclk_hz: clocks.sysclk().0,
+        })?;
 
         // Requires `PE1` and `EXTI1` to be set up correctly.
         device.enable_data_ready(true)?;
@@ -97,32 +149,32 @@ impl Gyroscope {
     }
 
     /// Identifies this chip by querying the `WHO_AM_I` register.
-    pub fn identify(&mut self) -> Result<bool, Error> {
+    pub fn identify(&mut self) -> Result<bool, GyroError> {
         self.l3gd20.identify()
     }
 
     /// Resets the device to reasonable defaults.
-    pub fn reset(&mut self) -> Result<(), Error> {
+    pub fn reset(&mut self) -> Result<(), GyroError> {
         self.l3gd20.reset()
     }
 
     /// Make the sensor as slow as possible.
-    pub fn slowpoke(&mut self) -> Result<(), Error> {
+    pub fn slowpoke(&mut self) -> Result<(), GyroError> {
         self.l3gd20.set_odr(OutputDataRate::Hz95)
     }
 
-    /// Identifies this chip by querying the `WHO_AM_I` register.
-    pub fn temp_raw(&mut self) -> Result<u8, Error> {
+    /// Reads the raw temperature from the `OUT_TEMP` register.
+    pub fn temp_raw(&mut self) -> Result<i8, GyroError> {
         self.l3gd20.temp_raw()
     }
 
     /// Fetches all data off the sensor.
-    pub fn xyz_raw(&mut self) -> Result<I16x3, Error> {
+    pub fn xyz_raw(&mut self) -> Result<I16x3, GyroError> {
         self.l3gd20.xyz_raw()
     }
 
     /// Get the sensor characteristics.
-    pub fn characteristics(&mut self) -> Result<Characteristics, Error> {
+    pub fn characteristics(&mut self) -> Result<Characteristics, GyroError> {
         self.l3gd20.characteristics()
     }
 }

@@ -27,7 +27,7 @@ use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use crate::byot::Byot;
 use crate::compass::Compass;
-use crate::gyro::{Gyroscope, GyroscopeChipSelect};
+use crate::gyro::{GyroError, Gyroscope, GyroscopeChipSelect, SpiError};
 use crate::leds::Leds;
 use crate::sensor_out_buffer::SensorOutBuffer;
 use crate::utils::{Micros, Millis};
@@ -541,7 +541,7 @@ fn handle_gyro_temperature_data(gyro: &mut Gyroscope, sensor_buffer: &mut Sensor
             )
         }
         Err(err) => {
-            log_spi_error(err);
+            log_gyro_error(err);
         }
     }
 }
@@ -653,7 +653,7 @@ fn identify_gyro(gryo: &mut Gyroscope) {
             defmt::error!("L3GD20 gyro sensor identification failed");
         }
         Err(err) => {
-            log_spi_error(err);
+            log_gyro_error(err);
         }
     };
 }
@@ -665,6 +665,13 @@ fn log_i2c_error(err: i2c::Error) {
         i2c::Error::Busy => defmt::warn!("I2C bus busy"),
         i2c::Error::Nack => defmt::error!("I2C NACK"),
         _ => defmt::error!("Unknown I2C error"),
+    }
+}
+
+fn log_gyro_error(err: GyroError) {
+    match err {
+        l3gd20_ng::Error::Spi(SpiError(err)) => log_spi_error(err),
+        err => defmt::error!("Gyroscope error: {}", err),
     }
 }
 
